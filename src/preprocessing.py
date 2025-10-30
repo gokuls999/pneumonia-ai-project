@@ -13,22 +13,19 @@ import pandas as pd
 class PreprocessedMultiModalDataset(Dataset):
     """
     Enhanced Dataset with pre-processing for multi-modal pneumonia data.
-    Applies image pre-processing (noise reduction, CLAHE, normalization, ROI segmentation,
-    augmentation, resizing) and text cleaning/tokenization.
+    Applies image pre-processing and text cleaning/tokenization.
 
     Args:
         data_dir (str): Path to raw data directory.
         tokenizer (Optional[Callable]): Tokenizer for text (e.g., Clinical BERT).
         image_transform (Optional[Callable]): Additional image transforms.
-        roi_model (Optional[torch.nn.Module]): Pre-trained U-Net for ROI segmentation.
         apply_augmentation (bool): Whether to apply data augmentation.
     """
     def __init__(self, data_dir: str, tokenizer: Optional[Callable] = None, image_transform: Optional[Callable] = None,
-                 roi_model: Optional[torch.nn.Module] = None, apply_augmentation: bool = False):
+                 apply_augmentation: bool = False):
         self.data_dir = data_dir
         self.tokenizer = tokenizer or AutoTokenizer.from_pretrained('emilyalsentzer/Bio_ClinicalBERT')
         self.image_transform = image_transform
-        self.roi_model = roi_model
         self.apply_augmentation = apply_augmentation
         
         # Load metadata
@@ -37,7 +34,7 @@ class PreprocessedMultiModalDataset(Dataset):
 
     def preprocess_image(self, image_path: str, is_ct: bool = False) -> np.ndarray:
         """
-        Pre-process image: noise reduction, CLAHE, normalization, ROI segmentation, resizing.
+        Pre-process image: noise reduction, CLAHE, normalization, augmentation, resizing.
 
         Args:
             image_path (str): Path to image file.
@@ -52,7 +49,7 @@ class PreprocessedMultiModalDataset(Dataset):
         if image is None:
             raise ValueError(f"Could not load image from {full_path}")
 
-        # Handle channels
+        # Handle channels correctly
         if is_ct:
             # Keep grayscale (1 channel)
             if len(image.shape) == 3:
@@ -94,17 +91,10 @@ class PreprocessedMultiModalDataset(Dataset):
         image = (image - mean) / std
 
         # Step 4: ROI Segmentation (stub for U-Net + EfficientNet; implement full model later)
-        if self.roi_model is not None:
-            # Placeholder: Assume model returns mask; resize to image size
-            image_tensor = torch.from_numpy(image).unsqueeze(0).float()  # Add batch dim
-            if len(image_tensor.shape) == 3:
-                image_tensor = image_tensor.unsqueeze(0)  # Add channel dim if grayscale
-            with torch.no_grad():
-                roi_mask = self.roi_model(image_tensor)
-                roi_mask = torch.sigmoid(roi_mask).squeeze().numpy()
-                if len(roi_mask.shape) == 2:
-                    roi_mask = np.repeat(roi_mask[:,:,np.newaxis], image.shape[2], axis=2)
-                image = image * roi_mask  # Apply mask
+        if False:  # Placeholder - load roi_model when available
+            # Example: image_tensor = torch.from_numpy(image).unsqueeze(0).float()
+            # roi_mask = self.roi_model(image_tensor)
+            pass
 
         # Step 5: Data Augmentation (if enabled)
         if self.apply_augmentation:
@@ -114,7 +104,7 @@ class PreprocessedMultiModalDataset(Dataset):
         if len(image.shape) == 3:
             image = cv2.resize(image, (224, 224))
         else:
-            image = cv2.resize(image, (224, 224))[:,:,np.newaxis]  # Keep grayscale
+            image = cv2.resize(image, (224, 224))[:,:,np.newaxis]  # Keep grayscale as 1-channel
 
         return image
 
@@ -126,7 +116,7 @@ class PreprocessedMultiModalDataset(Dataset):
         M = cv2.getRotationMatrix2D(center, angle, 1.0)
         image = cv2.warpAffine(image, M, (w, h))
         if np.random.rand() > 0.5:
-            image = cv2.flip(image, 1)  # Horizontal flip
+            image = cv2.flip(image, 1)
         return image
 
     def preprocess_text(self, text: str) -> torch.Tensor:
