@@ -13,16 +13,7 @@ from torchvision import transforms
 class MultiModalFusion(nn.Module):
     """
     Multi-modal fusion layer using attention-based cross-modal transformers.
-    Fuses text, CXR, and CT features with cross-attention, then projects via ViT as sequence processor.
-
-    Args:
-        text_dim (int): Dimension of text features (e.g., 768 for BERT).
-        cxr_dim (int): Dimension of CXR features (e.g., 1792 for EfficientNet B4).
-        ct_dim (int): Dimension of CT features (e.g., 1024 for DenseNet 121).
-        fusion_dim (int): Final fused dimension (e.g., 512).
-        num_heads (int): Number of attention heads (default 8).
-        num_layers (int): Number of transformer layers (default 2).
-        device (str): Device ('cuda' or 'cpu').
+    Fuses text, CXR, and CT features with cross-attention, then projects via ViT as sequence processor (adapted for 1D features).
     """
     def __init__(self, text_dim: int = 768, cxr_dim: int = 1792, ct_dim: int = 1024, fusion_dim: int = 512,
                  num_heads: int = 8, num_layers: int = 2, device: str = 'cpu'):
@@ -38,10 +29,12 @@ class MultiModalFusion(nn.Module):
         encoder_layer = nn.TransformerEncoderLayer(d_model=fusion_dim, nhead=num_heads, dim_feedforward=fusion_dim*4, batch_first=True)
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        # ViT for final fusion (adapted for sequence input, skipping patch_embed)
+        # ViT for final fusion (adapted for sequence input, bypassing image-specific parts)
         self.vit = timm.create_model('vit_base_patch16_224', pretrained=True, num_classes=0, global_pool='avg')
         self.vit.to(device)
         self.vit.eval()
+        self.vit.patch_embed = nn.Identity()  # Skip patch embedding
+        self.vit.pos_embed = nn.Parameter(torch.zeros(1, 1, self.vit.embed_dim))  # Dummy position embedding for seq_len=1
         
         # Projection to ViT embed_dim (768)
         self.to_vit_embed = nn.Linear(fusion_dim, self.vit.embed_dim)
@@ -86,7 +79,10 @@ class MultiModalFusion(nn.Module):
         # Project to ViT embed_dim and treat as sequence of 1 patch [batch, 1, 768]
         vit_input = self.to_vit_embed(fused).unsqueeze(1)  # [batch, 1, 768]
         
-        # Pass to ViT transformer layers directly (skip forward_features, use blocks)
+        # Add position embedding
+        vit_input = vit_input + self.vit.pos_embed
+        
+        # Pass to ViT transformer blocks directly (skip forward_features, use blocks)
         x = vit_input
         for block in self.vit.blocks:
             x = block(x)
