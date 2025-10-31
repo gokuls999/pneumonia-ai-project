@@ -1,158 +1,97 @@
-import os
-import re
-from torch.utils.data import Dataset, DataLoader
 import torch
-from PIL import Image
-import cv2
-import numpy as np
-from typing import Optional, Callable
-from transformers import AutoTokenizer
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from typing import Tuple, Optional
+from transformers import AutoModel
+import timm
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from src.preprocessing import PreprocessedMultiModalDataset
 from torchvision import transforms
-import pandas as pd
 
-class PreprocessedMultiModalDataset(Dataset):
+class FeatureExtractor(nn.Module):
     """
-    Enhanced Dataset with pre-processing for multi-modal pneumonia data.
-    Applies image pre-processing and text cleaning/tokenization.
+    Feature extraction module for multi-modal data.
+    Extracts embeddings from text (Clinical BERT) and images (EfficientNet B4 for CXR, DenseNet 121 for CT).
+    Applies global average pooling for projection.
 
     Args:
-        data_dir (str): Path to raw data directory.
-        tokenizer (Optional[Callable]): Tokenizer for text (e.g., Clinical BERT).
-        image_transform (Optional[Callable]): Additional image transforms.
-        apply_augmentation (bool): Whether to apply data augmentation.
+        text_model_name (str): Hugging Face model for text (e.g., 'emilyalsentzer/Bio_ClinicalBERT').
+        cxr_model_name (str): TIMM model for CXR (e.g., 'efficientnet_b4').
+        ct_model_name (str): TIMM model for CT (e.g., 'densenet121').
+        pooling (str): Pooling type ('global_avg' default).
+        device (str): Device ('cuda' or 'cpu').
     """
-    def __init__(self, data_dir: str, tokenizer: Optional[Callable] = None, image_transform: Optional[Callable] = None,
-                 apply_augmentation: bool = False):
-        self.data_dir = data_dir
-        self.tokenizer = tokenizer or AutoTokenizer.from_pretrained('emilyalsentzer/Bio_ClinicalBERT')
-        self.image_transform = image_transform
-        self.apply_augmentation = apply_augmentation
+    def __init__(self, text_model_name: str = 'emilyalsentzer/Bio_ClinicalBERT', 
+                 cxr_model_name: str = 'efficientnet_b4', ct_model_name: str = 'densenet121',
+                 pooling: str = 'global_avg', device: str = 'cpu'):
+        super().__init__()
+        self.device = device
+        self.pooling = pooling
         
-        # Load metadata
-        self.metadata = pd.read_csv(os.path.join(data_dir, 'metadata.csv'))
-        self.patient_ids = self.metadata['patient_id'].tolist()
+        # Text extractor (Clinical BERT)
+        self.text_model = AutoModel.from_pretrained(text_model_name)
+        self.text_model.to(device)
+        self.text_model.eval()
+        
+        # Image extractors
+        self.cxr_model = timm.create_model(cxr_model_name, pretrained=True, num_classes=0, global_pool='')
+        self.cxr_model.to(device)
+        self.cxr_model.eval()
+        
+        self.ct_model = timm.create_model(ct_model_name, pretrained=True, num_classes=0, global_pool='')
+        self.ct_model.to(device)
+        self.ct_model.eval()
+        
+        # Pooling layer
+        if pooling == 'global_avg':
+            self.pool = nn.AdaptiveAvgPool2d(1)
+        else:
+            raise ValueError("Pooling must be 'global_avg'")
 
-    def preprocess_image(self, image_path: str, is_ct: bool = False) -> np.ndarray:
+    def extract_text_features(self, tokenized_texts: dict) -> torch.Tensor:
+        """Extract features from tokenized text using Clinical BERT."""
+        with torch.no_grad():
+            # Squeeze extra dim if present (e.g., [batch, 1, seq] -> [batch, seq])
+            for k in tokenized_texts.keys():
+                if tokenized_texts[k].dim() == 3:
+                    tokenized_texts[k] = tokenized_texts[k].squeeze(1)
+            outputs = self.text_model(**{k: v.to(self.device) for k, v in tokenized_texts.items()})
+            features = outputs.last_hidden_state.mean(dim=1)  # Mean pooling over tokens
+        return features
+
+    def extract_image_features(self, image: torch.Tensor, is_ct: bool = False) -> torch.Tensor:
+        """Extract features from image using appropriate model."""
+        with torch.no_grad():
+            if is_ct:
+                model = self.ct_model
+            else:
+                model = self.cxr_model
+            features = model(image.to(self.device))
+            if self.pooling == 'global_avg':
+                features = self.pool(features).flatten(1)  # Global average pooling
+        return features
+
+    def forward(self, batch: tuple) -> tuple:
         """
-        Pre-process image: noise reduction, CLAHE, normalization, augmentation, resizing.
+        Extract features for a batch.
 
         Args:
-            image_path (str): Path to image file.
-            is_ct (bool): True for CT (grayscale), False for CXR (RGB).
+            batch: (tokenized_texts, cxr_images, ct_images, severities, classes) from dataset.
 
         Returns:
-            np.ndarray: Pre-processed image array (224x224x3, repeating grayscale for CT).
+            (text_features, cxr_features, ct_features)
         """
-        # Load image
-        full_path = os.path.join(self.data_dir, image_path)
-        image = cv2.imread(full_path, cv2.IMREAD_GRAYSCALE if is_ct else cv2.IMREAD_COLOR)
-        if image is None:
-            raise ValueError(f"Could not load image from {full_path}")
-
-        # Handle channels correctly
-        if is_ct:
-            # Keep grayscale (1 channel)
-            if len(image.shape) == 3:
-                image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        else:
-            # RGB for CXR (3 channels)
-            if len(image.shape) == 2:
-                image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
-            else:
-                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
-        # Step 1: Noise Reduction (Bilateral Filtering)
-        if len(image.shape) == 3:
-            for c in range(image.shape[2]):
-                image[:,:,c] = cv2.bilateralFilter(image[:,:,c], 9, 75, 75)
-        else:
-            image = cv2.bilateralFilter(image, 9, 75, 75)
-
-        # Step 2: Contrast Enhancement (CLAHE)
-        if is_ct:
-            # Grayscale CLAHE
-            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-            image = clahe.apply(image)
-            # Repeat grayscale to 3 channels for CNN
-            image = np.repeat(image[:,:,np.newaxis], 3, axis=2)
-        else:
-            # LAB for RGB
-            lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
-            l, a, b = cv2.split(lab)
-            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-            cl = clahe.apply(l)
-            image = cv2.merge((cl, a, b))
-            image = cv2.cvtColor(image, cv2.COLOR_LAB2RGB)
-
-        # Step 3: Image Normalization (with epsilon for zero std)
-        image = image.astype(np.float32)
-        mean = np.mean(image)
-        std = np.std(image)
-        if std == 0:
-            std = 1e-8  # Epsilon to avoid division by zero
-        image = (image - mean) / std
-
-        # Step 4: ROI Segmentation (stub for U-Net + EfficientNet; implement full model later)
-        if False:  # Placeholder - load roi_model when available
-            pass
-
-        # Step 5: Data Augmentation (if enabled)
-        if self.apply_augmentation:
-            image = self.augment_image(image)
-
-        # Step 6: Image Resizing (224x224)
-        image = cv2.resize(image, (224, 224))
-
-        return image
-
-    def augment_image(self, image: np.ndarray) -> np.ndarray:
-        """Basic augmentation (rotation, flip)."""
-        h, w = image.shape[:2]
-        angle = np.random.uniform(-15, 15)
-        center = (w // 2, h // 2)
-        M = cv2.getRotationMatrix2D(center, angle, 1.0)
-        image = cv2.warpAffine(image, M, (w, h))
-        if np.random.rand() > 0.5:
-            image = cv2.flip(image, 1)
-        return image
-
-    def preprocess_text(self, text: str) -> dict:
-        """Clean and tokenize text for Clinical BERT."""
-        text = re.sub(r'\s+', ' ', text.strip())
-        text = re.sub(r'[^a-zA-Z0-9\s.,!?;:\-]', '', text)
-        tokens = self.tokenizer.encode_plus(text, max_length=512, padding='max_length', truncation=True, return_tensors='pt')
-        return {'input_ids': tokens['input_ids'], 'attention_mask': tokens['attention_mask']}  # Dict with tensors
-
-    def __len__(self) -> int:
-        return len(self.patient_ids)
-
-    def __getitem__(self, idx: int) -> tuple:
-        patient_id = self.patient_ids[idx]
-        row = self.metadata[self.metadata['patient_id'] == patient_id].iloc[0]
+        tokenized_texts, cxr_images, ct_images, severities, classes = batch
         
-        # Pre-process text
-        text = row['notes']
-        tokenized_text = self.preprocess_text(text)
+        text_features = self.extract_text_features(tokenized_texts)
+        cxr_features = self.extract_image_features(cxr_images, is_ct=False)
+        ct_features = self.extract_image_features(ct_images, is_ct=True)
         
-        # Pre-process CXR
-        cxr_path = row['cxr_path']
-        cxr_image = self.preprocess_image(cxr_path, is_ct=False)
-        if self.image_transform:
-            cxr_image = self.image_transform(cxr_image)
-        
-        # Pre-process CT
-        ct_path = row['ct_path']
-        ct_image = self.preprocess_image(ct_path, is_ct=True)
-        if self.image_transform:
-            ct_image = self.image_transform(ct_image)
-        
-        # Labels
-        severity_label = row['severity']
-        class_label = row['pneumonia_type']
-        
-        return tokenized_text, cxr_image, ct_image, severity_label, class_label
+        return text_features, cxr_features, ct_features
 
-# Example usage
+# Example usage with Phase 2 dataset
 if __name__ == "__main__":
     transform = transforms.Compose([
         transforms.ToTensor(),
@@ -161,7 +100,13 @@ if __name__ == "__main__":
     dataset = PreprocessedMultiModalDataset(data_dir='data/raw', image_transform=transform)
     dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
     
+    # Extractor
+    extractor = FeatureExtractor(device='cpu')
+    
     for batch in dataloader:
-        tokenized_texts, cxrs, cts, severities, classes = batch
-        print("Pre-processed batch loaded successfully!")
+        text_feats, cxr_feats, ct_feats = extractor(batch)
+        print("Feature extraction successful!")
+        print(f"Text features shape: {text_feats.shape}")
+        print(f"CXR features shape: {cxr_feats.shape}")
+        print(f"CT features shape: {ct_feats.shape}")
         break
