@@ -41,7 +41,7 @@ class PreprocessedMultiModalDataset(Dataset):
             is_ct (bool): True for CT (grayscale), False for CXR (RGB).
 
         Returns:
-            np.ndarray: Pre-processed image array (224x224x1 or x3).
+            np.ndarray: Pre-processed image array (224x224x3, repeating grayscale for CT).
         """
         # Load image
         full_path = os.path.join(self.data_dir, image_path)
@@ -73,6 +73,8 @@ class PreprocessedMultiModalDataset(Dataset):
             # Grayscale CLAHE
             clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
             image = clahe.apply(image)
+            # Repeat grayscale to 3 channels for CNN
+            image = np.repeat(image[:,:,np.newaxis], 3, axis=2)
         else:
             # LAB for RGB
             lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
@@ -92,8 +94,6 @@ class PreprocessedMultiModalDataset(Dataset):
 
         # Step 4: ROI Segmentation (stub for U-Net + EfficientNet; implement full model later)
         if False:  # Placeholder - load roi_model when available
-            # Example: image_tensor = torch.from_numpy(image).unsqueeze(0).float()
-            # roi_mask = self.roi_model(image_tensor)
             pass
 
         # Step 5: Data Augmentation (if enabled)
@@ -101,10 +101,7 @@ class PreprocessedMultiModalDataset(Dataset):
             image = self.augment_image(image)
 
         # Step 6: Image Resizing (224x224)
-        if len(image.shape) == 3:
-            image = cv2.resize(image, (224, 224))
-        else:
-            image = cv2.resize(image, (224, 224))[:,:,np.newaxis]  # Keep grayscale as 1-channel
+        image = cv2.resize(image, (224, 224))
 
         return image
 
@@ -124,7 +121,7 @@ class PreprocessedMultiModalDataset(Dataset):
         text = re.sub(r'\s+', ' ', text.strip())
         text = re.sub(r'[^a-zA-Z0-9\s.,!?;:\-]', '', text)
         tokens = self.tokenizer.encode_plus(text, max_length=512, padding='max_length', truncation=True, return_tensors='pt')
-        return {'input_ids': tokens['input_ids'], 'attention_mask': tokens['attention_mask']}
+        return {'input_ids': tokens['input_ids'], 'attention_mask': tokens['attention_mask']}  # Dict with tensors
 
     def __len__(self) -> int:
         return len(self.patient_ids)
