@@ -3,27 +3,66 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from typing import Tuple, Optional
 import optuna
+from pgmpy.models import DiscreteBayesianNetwork
+from pgmpy.factors.discrete import TabularCPD
+from pgmpy.inference import VariableElimination
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from src.fusion import MultiModalFusion
-from src.feature_extraction import FeatureExtractor
 from src.preprocessing import PreprocessedMultiModalDataset
 from torchvision import transforms
 
+class ProbabilisticOutput(nn.Module):
+    """
+    Probabilistic output layer using Bayesian Network for uncertainty.
+    Integrates with pgmpy for Bayesian inference on multi-task predictions.
+    """
+    def __init__(self, severity_dim: int = 1, class_dim: int = 2, device: str = 'cpu'):
+        super().__init__()
+        self.device = device
+        
+        # Bayesian Network (simple dependency: severity influences class)
+        self.bn_model = DiscreteBayesianNetwork([('severity', 'class')])
+        
+        # Define CPDs with correct shapes
+        cpd_severity = TabularCPD('severity', 3, [[0.3], [0.4], [0.3]])  # Shape (3, 1) for 3 states
+        cpd_class = TabularCPD('class', 2, [[0.7, 0.4, 0.2], [0.3, 0.6, 0.8]], 
+                               evidence=['severity'], evidence_card=[3])  # Shape (2, 3) for 2 states, 3 evidence
+        
+        self.bn_model.add_cpds(cpd_severity, cpd_class)
+        self.bn_model.check_model()
+        self.infer = VariableElimination(self.bn_model)
+        
+        # Softmax for class probabilities
+        self.softmax = nn.Softmax(dim=1)
+
+    def forward(self, severity_logits: torch.Tensor, class_logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+        """
+        Forward pass with Bayesian inference for probabilistic outputs.
+
+        Args:
+            severity_logits: [batch, 1] from severity head.
+            class_logits: [batch, 2] from class head.
+
+        Returns:
+            (severity_probs, class_probs, bayesian_evidence): Probabilities and Bayesian evidence dict.
+        """
+        severity_probs = torch.sigmoid(severity_logits)  # [batch, 1]
+        class_probs = self.softmax(class_logits)  # [batch, 2]
+        
+        # Bayesian inference (dummy evidence; in practice, add prior evidence from data)
+        bayesian_evidence = {'evidence': {}, 'probabilities': {}}
+        for i in range(severity_probs.shape[0]):
+            evidence = {'severity': int(severity_probs[i].item() * 3)}  # Discretize to 0-2
+            batch_evidence = self.infer.query(variables=['class'], evidence=evidence)
+            bayesian_evidence['evidence'][i] = evidence
+            bayesian_evidence['probabilities'][i] = batch_evidence
+        
+        return severity_probs, class_probs, bayesian_evidence
+
 class DeepLearningBackbone(nn.Module):
     """
-    Deep learning backbone for the multi-modal pneumonia system.
-    Uses an efficient transformer encoder with Leaky ReLU, Dropout/L2 regularization, and mixed precision support.
-
-    Args:
-        input_dim (int): Dimension of fused input features (e.g., 768 from fusion).
-        hidden_dim (int): Hidden dimension for transformer layers.
-        num_layers (int): Number of transformer layers (default 6).
-        num_heads (int): Number of attention heads (default 8).
-        dropout_rate (float): Dropout rate (default 0.1).
-        l2_lambda (float): L2 regularization lambda (default 1e-4).
-        device (str): Device ('cuda' or 'cpu').
+    Complete model with multi-task learning and probabilistic output.
     """
     def __init__(self, input_dim: int = 768, hidden_dim: int = 512, num_layers: int = 6, num_heads: int = 8,
                  dropout_rate: float = 0.1, l2_lambda: float = 1e-4, device: str = 'cpu'):
@@ -34,39 +73,43 @@ class DeepLearningBackbone(nn.Module):
         # Input projection
         self.input_proj = nn.Linear(input_dim, hidden_dim)
         
-        # Transformer backbone (efficient encoder)
+        # Transformer backbone
         encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=num_heads, dim_feedforward=hidden_dim * 4,
                                                    dropout=dropout_rate, activation='relu', batch_first=True)
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        # Leaky ReLU activation
+        # Leaky ReLU and dropout
         self.leaky_relu = nn.LeakyReLU(negative_slope=0.1)
-        
-        # Dropout for regularization
         self.dropout = nn.Dropout(dropout_rate)
         
-        # Multi-task outputs (severity score as regression, classification as 2-class)
+        # Multi-task heads (shared backbone)
         self.severity_head = nn.Linear(hidden_dim, 1)
         self.class_head = nn.Linear(hidden_dim, 2)
+        
+        # Probabilistic output
+        self.probabilistic_output = ProbabilisticOutput(device=device)
 
-    def forward(self, fused_feats: torch.Tensor, use_mixed_precision: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, fused_feats: torch.Tensor, use_mixed_precision: bool = False) -> Tuple[torch.Tensor, torch.Tensor, dict]:
         """
-        Forward pass through the backbone.
+        Forward pass with probabilistic output.
 
         Args:
-            fused_feats: [batch, fusion_dim] from fusion layer.
-            use_mixed_precision: If True, use FP16 (requires amp context).
+            fused_feats: [batch, fusion_dim] from fusion.
+            use_mixed_precision: Enable FP16.
 
         Returns:
-            (severity_logits, class_logits): [batch, 1] and [batch, 2]
+            (severity_probs, class_probs, bayesian_evidence)
         """
         if use_mixed_precision:
-            fused_feats = fused_feats.half()  # FP16
+            with torch.autocast(device_type='cpu'):
+                fused_feats = fused_feats.half()
+        else:
+            fused_feats = fused_feats.float()
+            
+        fused_feats = fused_feats.float()    
         
         # Project input
         x = self.input_proj(fused_feats)  # [batch, hidden_dim]
-        
-        # Add sequence dimension for transformer (treat as seq_len=1)
         x = x.unsqueeze(1)  # [batch, 1, hidden_dim]
         
         # Transformer backbone
@@ -77,81 +120,90 @@ class DeepLearningBackbone(nn.Module):
         x = self.leaky_relu(x)
         x = self.dropout(x)
         
-        # Multi-task outputs
+        # Multi-task logits
         severity_logits = self.severity_head(x)  # [batch, 1]
-        class_logits = self.class_head(x)  # [batch, 2] for bacterial/viral
+        class_logits = self.class_head(x)  # [batch, 2]
         
-        return severity_logits, class_logits
+        if self.training:
+            severity_probs = torch.sigmoid(severity_logits)
+            class_probs = torch.softmax(class_logits, dim=1)
+            bayesian_evidence = None
+        else:
+            severity_probs, class_probs, bayesian_evidence = self.probabilistic_output(severity_logits, class_logits)
+            
+        return severity_probs, class_probs, bayesian_evidence        
 
-def tune_hyperparameters(trial: optuna.Trial, dataloader: DataLoader, device: str = 'cpu') -> float:
+def train_model(model: nn.Module, train_loader: DataLoader, val_loader: DataLoader, epochs: int = 10, device: str = 'cpu'):
     """
-    Optuna objective for hyperparameter tuning.
-
-    Args:
-        trial: Optuna trial object.
-        dataloader: Validation DataLoader.
-        device: Device to use.
-
-    Returns:
-        float: Validation loss.
+    Training pipeline with multi-task loss and mixed precision.
     """
-    # Suggest hyperparameters
-    hidden_dim = trial.suggest_categorical('hidden_dim', [256, 512, 1024])
-    num_layers = trial.suggest_int('num_layers', 4, 8)
-    num_heads = trial.suggest_categorical('num_heads', [4, 8, 16])
-    dropout_rate = trial.suggest_float('dropout_rate', 0.05, 0.2)
-    l2_lambda = trial.suggest_float('l2_lambda', 1e-5, 1e-3)
-    
-    # Create model
-    model = DeepLearningBackbone(input_dim=768, hidden_dim=hidden_dim, num_layers=num_layers, num_heads=num_heads,
-                                 dropout_rate=dropout_rate, l2_lambda=l2_lambda, device=device)
-    model.to(device)
-    
-    # Dummy training (replace with real in Phase 6)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=l2_lambda)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=model.l2_lambda)
     criterion_severity = nn.MSELoss()
     criterion_class = nn.CrossEntropyLoss()
     
-    model.train()
-    total_loss = 0.0
-    for batch in dataloader:
-        tokenized_texts, cxrs, cts, severities, classes = batch
-        # Dummy fused feats (replace with real fusion in Phase 6)
-        fused_feats = torch.randn(severities.shape[0], 768, device=device)
-        
-        optimizer.zero_grad()
-        severity_logits, class_logits = model(fused_feats, use_mixed_precision=False)
-        
-        loss_severity = criterion_severity(severity_logits.squeeze(), severities.float())
-        loss_class = criterion_class(class_logits, classes.long())
-        loss = loss_severity + loss_class
-        
-        loss.backward()
-        optimizer.step()
-        
-        total_loss += loss.item()
+    model.to(device)
     
-    avg_loss = total_loss / len(dataloader)
-    return avg_loss
+    for epoch in range(epochs):
+        model.train()
+        total_loss = 0.0
+        for batch in train_loader:
+            tokenized_texts, cxrs, cts, severities, classes = batch
+            # Dummy fused feats (replace with real fusion in full pipeline)
+            fused_feats = torch.randn(severities.shape[0], 768, device=device)
+            
+            optimizer.zero_grad()
+            severity_probs, class_probs, _ = model(fused_feats, use_mixed_precision=True)
+            
+            loss_severity = criterion_severity(severity_probs.squeeze(), severities.float())
+            loss_class = criterion_class(class_probs, classes.long())
+            loss = loss_severity + loss_class
+            
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+        
+        avg_loss = total_loss / len(train_loader)
+        print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}")
+        
+        # Validation
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for batch in val_loader:
+                tokenized_texts, cxrs, cts, severities, classes = batch
+                fused_feats = torch.randn(severities.shape[0], 768, device=device)
+                severity_probs, class_probs, _ = model(fused_feats, use_mixed_precision=False)
+                
+                loss_severity = criterion_severity(severity_probs.squeeze(), severities.float())
+                loss_class = criterion_class(class_probs, classes.long())
+                loss = loss_severity + loss_class
+                val_loss += loss.item()
+        
+        avg_val_loss = val_loss / len(val_loader)
+        print(f"Validation Loss: {avg_val_loss:.4f}")
 
 # Example usage
 if __name__ == "__main__":
     transform = transforms.Compose([transforms.ToTensor()])
     
     dataset = PreprocessedMultiModalDataset(data_dir='data/raw', image_transform=transform)
-    dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
+    train_loader = DataLoader(dataset, batch_size=2, shuffle=True)
     
-    # Example backbone
-    backbone = DeepLearningBackbone(input_dim=768, device='cpu')
+    # Complete model with probabilistic output
+    model = DeepLearningBackbone(input_dim=768, device='cpu')
     
-    # Test forward pass (with dummy fused feats from fusion)
+    # Test forward pass
     dummy_fused = torch.randn(2, 768)
-    severity_logits, class_logits = backbone(dummy_fused)
-    print("Deep learning backbone successful!")
-    print(f"Severity logits shape: {severity_logits.shape}")  # [2, 1]
-    print(f"Class logits shape: {class_logits.shape}")  # [2, 2]
-
-    # Example tuning (uncomment for real tuning in Phase 6)
-    # study = optuna.create_study(direction='minimize')
-    # study.optimize(lambda trial: tune_hyperparameters(trial, dataloader), n_trials=10)
-    # print("Best hyperparameters:", study.best_params)
+    severity_probs, class_probs, evidence = model(dummy_fused, use_mixed_precision=False)
+    print("Multi-task model with probabilistic output successful!")
+    print(f"Severity probs shape: {severity_probs.shape}")
+    print(f"Class probs shape: {class_probs.shape}")
+    
+    if evidence is not None:
+        print(f"Bayesian evidence keys: {list(evidence['evidence'].keys())}")
+    else:
+        print("Bayesian evidence skipped (training mode).")    
+    
+    # Train (dummy; use real data in full run)
+    train_model(model, train_loader, train_loader, epochs=1)
